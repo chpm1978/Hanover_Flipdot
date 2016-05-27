@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
-import fonts
+HEADER = '\x02'
+FOOTER = '\x03'
 
 class Output2Display(object):
     "Output to the display over serial connection"
@@ -13,255 +14,235 @@ class Output2Display(object):
         self.serial.write(data)
 
 
-class Output2Console(object):
-    "Output to console"
-    LEN_HEADER = 5
-    LEN_FOOTER = 3
-    LEN_COLUMN = 16
+def chr_to_hex_to_4bit(character):
+    "Convert the character from hex to number to 4 bit binary string."
+    number = int(character, 16)
+    binary = bin(number)[2::].zfill(4)
+    return binary
+
+def decode_2_bytes_to_number(one, two):
+    "Convert the havana encoded two bytes to a number."
+    one = chr_to_hex_to_4bit(one)
+    two = chr_to_hex_to_4bit(two)
+    number = int(one+two, 2)
+    return number
+
+def encode_number_to_2_bytes(number):
+    "Convert number to havana encoded two bytes"
+    binary = bin(number)[2::].zfill(8)
+    one = hex(int(binary[:4], 2))[2:].upper()
+    two = hex(int(binary[4:], 2))[2:].upper()
+    return one, two
+
+def calculate_checksum(data, header, head):
+    "Calculate checksum"
+    summed = 0 
+    tmp = [ord(head)]
+    for entry in header:
+        tmp.append(ord(entry))
     
-    def __init__(self, mirror=True):
-        self.count = 0
+    summed += sum(tmp)
+    
+    tmp = list()
+    for number in data:
+        for value in encode_number_to_2_bytes(number):
+            tmp.append(ord(value))
+    
+    summed += sum(tmp)
+    summed += 1
+    
+    summed = summed & 0xFF # Chop of everything that falls outside a byte
+    summed = summed ^ 255 # XOR it
+    summed += 1
+    return summed
+                         
+    
+class OutputSerial(object):
+    "Hook into the serial protocol"
+    HEADER_LENGTH = 4
+    FOOTER_LENGTH = 2
+    ROWS = 16
+    COLUMNS = None
+    ADDRESS = None
+    
+    
+    def __init__(self):
+        self.header = list()
+        self.footer = list()
+        self.worker = self.fsm_data
+        self.buffer = None # 1 byte buffer
+        self.hindex = 0
+        self.vindex = 0
         self.data = list()
-        self.mirror = mirror
-        
-        
-    def write(self, data):
-        "Write to console"
-        self.data.append(data)
-        if len(self.data) == 520:
-            self.process()
-        
-    def process(self):
-        "Process data"
-        data = self.data[::] # make a working copy
-        
-        # Extract Header
-        head = data[:self.LEN_HEADER]
-        data = data[self.LEN_HEADER:]
-        
-        # Extract Footer
-        foot = data[-self.LEN_FOOTER:]
-        data = data[:-self.LEN_FOOTER]
+    
+    def fsm_head(self, character):
+        # FSM, handle header
+        self.header.append(character)
+        if len(self.header) == self.HEADER_LENGTH:
+            # When we got the full header we can now calculate the size.
+            self.ADDRESS = decode_2_bytes_to_number('0', self.header[1])
+            constant = decode_2_bytes_to_number('0', self.header[0])
+            number = decode_2_bytes_to_number(self.header[2], self.header[3]) 
+            self.COLUMNS = (number * 8) / self.ROWS
+            self.worker = self.fsm_data
+            print('#'*self.COLUMNS)
+            print('# Header  : ' + str(self.header))
+            print('#'*self.COLUMNS)
+            print('# Constant: ' + str(constant))
+            print('# Address : ' + str(self.ADDRESS))
+            print('# Rows    : ' + str(self.ROWS))
+            print('# Columns : ' + str(self.COLUMNS))
+            print('#'*self.COLUMNS)
 
-        print('Required terminal width: ' + \
-                           str(len(data) * 4 / self.LEN_COLUMN) + ' characters')
-
-        print('Data protocol header: ' + str(head))
-        print('Data protocol footer: ' + str(foot))
+            
+    def fsm_foot(self, character):
+        # FSM, handle footer
+        self.footer.append(character)
+        if len(self.footer) == self.FOOTER_LENGTH:
+            print('# Footer  : ' + str(self.footer))
+            print('# Checksum: ' + str(decode_2_bytes_to_number(*self.footer)))
+            calculated = calculate_checksum(self.data, self.header, HEADER)
+            print('# Rehashed: ' + str(calculated))
+            
+            self.worker = self.fsm_done
+            self.worker('')
+            
+    def fsm_work(self, character):
+        # Handle the character
+        self.data.append(decode_2_bytes_to_number(self.buffer, character))
+                        
+    def fsm_data(self, character):
+        # FSM, handle data 
+        if self.buffer is None:
+            self.buffer = character
+        else:
+            self.fsm_work(character)
+            self.buffer = None
         
-        # We have now 512 bytes left in data.
-        # Each byte is an ASCII character (text).
-        # Each character can only be one of 0123456789ABCDEF, effectively a very
-        # inefficient encoding of hexadecimal. Each character, being hexadecimal
-        # encodes 4 binary values vertically.
+    def fsm_done(self, character):
+        # FSM, handle done
+        print('# Data    : ' + str(len(self.data)))
+        print('#'*self.COLUMNS)
         
-        
-        # Iterate over each character, convert it to a number, then to binary
         tmp = list()
-        for character in data:
-            number = int(character, 16)
-            binary = bin(number)[2::].zfill(4)
-            tmp.append(binary)
-        data = ''.join(tmp)
-        
-        # Setup an empty matrix with row amount equal to binary_height_column
-        tmp = list()
-        while len(tmp) < self.LEN_COLUMN:
+        while len(tmp) < self.ROWS:
             tmp.append([])
         
-        # Iterate over the binary string, chopping it up in columns
-        while len(data) > 0:
-            column, data = data[:self.LEN_COLUMN], data[self.LEN_COLUMN:]
-            
-            # iterate over the column and append each 'bit' to the corresponding
-            # row
-            for index, bit in enumerate(column):
-                if bit == '0':
-                    appendix = '-'
-                elif bit == '1':
-                    appendix = '#'
-                tmp[index].append(appendix)
+        first = None
+        for entry in self.data:
+            if first is None:
+                first = entry
+            else:
+                one = bin(entry)[2::].zfill(8)
+                two = bin(first)[2::].zfill(8)
+                txt = one+two
+                txt = txt.replace('0', '-')
+                txt = txt.replace('1', '#')
+                txt = txt[::-1]
+                for index, character in enumerate(txt):
+                    tmp[index].append(character)
+                first = None 
         
-        if self.mirror:
-            # Flip the rows vertically
-            tmp = tmp[::-1]
-            
-        for row in tmp: 
-            print(''.join(row)) 
-        
-
-
-class Display(object):
-    '''
-    Driver for the Hanover display.
-    Currently, this driver only works with resolution of 128x16, at address 1
-    This limitation must be changed in a future version.
-    '''
-    def __init__(self, address, columns, lines, font):
-        if lines % 8:
-            lines = lines + (8-(lines % 8))
-
-        self.columns = columns - 1
-
-        self.data = ((lines * columns) / 8)
-
-        res1, res2 = self.byte_to_ascii(self.data & 0xff)
-
-        self.byte_per_column = lines / 8
-
-        address += 16
-        
-        add1, add2 = self.byte_to_ascii(address)
-        # Header part
-        self.header = [0x2, add1, add2, res1, res2]
-        # Footer part
-        self.footer = [0x3, 0x00, 0x00]
-        # Data buffer initialized to 0
-        self.buf = [0] * (self.data / self.byte_per_column)
-        # Fonts object
-        self.font = font
-
-    def connect(self, output):
-        '''
-        Connect to the serial device
-        '''
-        self.ser = output
-
-    def set_font(self, font):
-        '''
-        Set a font
-        '''
-        self.font = font
-
-    def erase_all(self):
-        '''
-        Erase all the screen
-        '''
-        for i in range(len(self.buf)):
-            self.buf[i] = 0
-
-    def write_text(self, text, line=0, column=0):
-        '''
-        Write text on the first line
-        '''
-        # Detect the size
-        mask = 0xff
-        for byte in self.font[0x31]:
-             if byte.bit_length >= 9:
-                mask = 0xffff
-                break
-
-        # Parse all the characters
-        for char in text:
-            # Fill the buffer
-            for i in range(len(self.font[0])):
-                if column > self.columns:
-                    return 0
-                self.buf[column] &= ~((mask << line) & (1 << (self.byte_per_column * 8))) -1
-                self.buf[column] |= ((self.font[ord(char)][i])<<line) &  (1 << (self.byte_per_column * 8)) - 1
-                column += 1
-
-    def byte_to_ascii(self, byte):
-        '''
-        Convert a byte to its ascii reprensentation.
-        The transmission represent each byte by their ASCII representation.
-        For example, 0x67 is reprensented by 0x36 0x37 (ascii 6 and ascii 7)
-        This is not an elegant way to convert the data, and this function must
-        be refactored
-        '''
-        b1 = 0
-        b2 = 0
-        b1 = byte >> 4
-        if b1 > 9:
-            b1 += 0x37
-        else:
-            b1 += 0x30
-
-        b2 = byte % 16
-        if b2 > 9:
-            b2 += 0x37
-        else:
-            b2 += 0x30
-
-        return (b1, b2)
-
-    def __checksum__(self, dsum):
-        '''
-        Compute the checksum of the data frame
-        '''
-        sum = 0
-        # Sum all bytes of the header and the buffer
-        for byte in self.header:
-            sum += byte
-        
-        sum += dsum
-
-        # Start of text (0x02) must be removed,
-        # End of text (0x03) must be added
-        sum += 1
-
-        # Result must be casted to 8 bits
-        sum = sum & 0xFF
-
-        # Checksum is the sum XOR 255 + 1. So, sum of all bytes + checksum
-        # is equal to 0 (8 bits)
-        crc =  (sum ^ 255) + 1
-
-        # Transfor the checksum in ascii
-        crc1, crc2 = self.byte_to_ascii(crc)
-
-        # Add the checksum on the footer
-        self.footer[1] = crc1
-        self.footer[2] = crc2
-
-
-    def send(self):
-        '''
-        Send the frame via the serial port
-        :return: Return 0 on success, -1 on errors
-        '''
-
-        crc = 0
-        try:
-            # Send the header
-            for byte in self.header:
-                self.ser.write(chr(byte))
-            # Send the data
-            for col in self.buf:
-                for i in range(self.byte_per_column):
-                    b1, b2 = self.byte_to_ascii((col >> (8*i) & 0xFF))
-                    crc += b1
-                    crc += b2
-                    self.ser.write(chr(b1))
-                    self.ser.write(chr(b2))
+        for row in tmp:
+            pass
+            print(''.join(row))
+        print('#'*self.COLUMNS)
     
-            # Compute the checksum
-            self.__checksum__(crc)
-
-            # Send the footer
-            for byte in self.footer:
-                self.ser.write(chr(byte))
-
-            return 0
-        except:
-            return -1
+        
+    def write(self, character):
+        if character == HEADER:
+            self.worker = self.fsm_head
+        elif character == FOOTER:
+            self.worker = self.fsm_foot
+        else:
+            self.worker(character)
 
 
-def main(text, console_display=False):
-    display = Display(1, 128, 16, fonts.unscii_mcr)
+def encode(matrix_hash_dash, address=1):
+    "Encode the matix into Hanover display serial protocol"
+    matrix = matrix_hash_dash.split('\n')
+    constant = 1
+    rows = len(matrix)
+    columns = len(matrix[0])
+    for column in matrix:
+        if len(column) != columns:
+            raise ValueError('Matrix not well formed.')
     
+    header = [str(constant), 
+              str(address)]
+    data_size = (rows*columns) / 8
+    for character in encode_number_to_2_bytes(data_size):
+        header.append(character)
+        
+    data = list()
+    for index_column in range(columns):
+        column = list()
+        for index_row in range(rows):
+            column.append(matrix[index_row][index_column])
+        
+        column = ''.join(column)
+        column = column.replace(' ', '0')
+        column = column.replace('-', '0')
+        column = column.replace('#', '1')
+        
+        column = column[::-1]
+        
+        nibble_c = column[:4]
+        nibble_d = column[4:8] 
+        nibble_a = column[8:12]
+        nibble_b = column[12:]
+        for nibble in [nibble_a, nibble_b, nibble_c, nibble_d]:
+            number = int(nibble, 2)
+            string = hex(number)[2:].upper()
+            data.append(string)
+    
+    checksum_data = list()
+    zipped = zip(data[::2], data[1::2])
+    for item in zipped:
+        number = decode_2_bytes_to_number(*item)
+        checksum_data.append(number)
+
+    footer = calculate_checksum(checksum_data, header, HEADER)
+    footer = encode_number_to_2_bytes(footer)            
+
+    returns = [HEADER] + header[::] + data + [FOOTER] + list(footer) 
+    returns = ''.join(returns)
+    
+    return returns 
+
+
+def main(matrix, port=None, address=1, console_display=False):    
     if console_display:
-        output = Output2Console()
+        output = OutputSerial(port)
     else:
         output = Output2Display()
         
-    display.connect(output)
-    
-    display.write_text(text)
-    display.send()
+    encoded = encode(matrix, address)
+    for character in encoded:
+        output.write(character)
+        
 
+TMP = """
+------------------------------------------------------------------------------------------------
+--######---##------------------------------------###-###----------######---##-------------------
+--##-------##------###---------------------------#######----------##-------##------###----------
+--##-------##------------#######-#######-##---##-##-#-##-#######--##-------##------------#######
+-#####-----##------##----##---##-##---##-###--##-##---##-##------#####----###------##----##---##
+-###-------###-----###---##---##-##---##-###--##-###--##-###-----###------###------###---##---##
+-###-------###-----###---#######-#######-#######-###--##-###-----###------###------###---#######
+-###-------###-----###---###-----###----------##-###--##-#######-###------######---###---###----
+-------------------------###-----###-----#######-----------------------------------------###----
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------
+"""
 
 if __name__ == '__main__':
-    main('FlippyMcFlip', console_display=True)
+    data = TMP.strip()
+    main(data, port='/dev/ttyUSB0', console_display=True)
     
     
