@@ -242,7 +242,8 @@ TMP = """
 """
 
 if __name__ == '__main__':
-    data = TMP.strip()
+    import glyphs
+    data = glyphs.container.strip()
     main(data, port='/dev/ttyUSB0', console_display=True)
     
     
